@@ -6,18 +6,6 @@ budgeted active visual inspection: an agent moves and resizes an attention windo
 the image, receives reward from expert XML bounding-box annotations, and must classify
 the disease as `GrayMold`, `Viral`, or `Wilt`.
 
-## Why This Is Interesting for a Paper
-
-- It uses plant pathology annotations as a reward signal instead of using RL as a
-  superficial classifier.
-- It compares multiple PPO reward designs.
-- It measures disease classification, visual localization, inspection cost, and
-  learning dynamics.
-- It avoids episodes without diagnosis: at the end of the inspection budget, every
-  episode is evaluated as a disease decision.
-- It produces reproducible artifacts: metadata, logs, per-episode metrics, CSV tables,
-  LaTeX tables, confusion matrices, and figures.
-
 ## Quick Smoke Test
 
 Use this to verify that the code runs end to end:
