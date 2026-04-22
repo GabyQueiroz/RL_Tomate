@@ -6,11 +6,11 @@ budgeted active visual inspection: an agent moves and resizes an attention windo
 the image, receives reward from expert XML bounding-box annotations, and classifies the
 disease as `GrayMold`, `Viral`, or `Wilt`.
 
-The current improved version adds an auxiliary visual-evidence classifier trained only
+The version adds an auxiliary visual-evidence classifier trained only
 on the training split. Its class probabilities are appended to the PPO state, while PPO
 still learns the active inspection policy and the attention trajectory.
 
-## Latest Paper Run
+## Paper Run
 
 ```powershell
 python .\tomato_ppo_experiments.py --dataset ".\Tomato Disease Dataset" --output ".\runs\tomato_ppo_paper_run_improved" --timesteps 50000 --eval-freq 5000 --eval-episodes 100 --variants localization balanced efficient --n-envs 4 --image-size 64 --cache-side 256 --preload-images --n-steps 128 --n-epochs 4 --aux-crops-per-image 3
@@ -51,21 +51,3 @@ Each run creates an output folder under `runs/` containing:
 - `balanced`: combines IoU, classification reward, and a small step penalty.
 - `efficient`: penalizes large windows and extra steps to encourage economical visual inspection.
 
-## Article Files
-
-- `artigo_metodologia_resultados_atualizado.tex`: methodology and results in Portuguese, ready to adapt into the paper.
-- `metodologia_ppo_tomate.tex`: detailed PPO methodology draft.
-- `RELATORIO_RL_TOMATE.md`: updated summary of the latest experiment.
-
-## How to Judge the Model
-
-Use the held-out test metrics in `tables/ppo_vs_baselines.csv` and
-`tables/ppo_variant_comparison.csv`.
-
-Strong evidence that the model is useful:
-
-- Macro-F1 is above majority-class and random baselines.
-- Mean best IoU improves, showing alignment with expert annotations.
-- Per-class F1 is non-zero and balanced across `GrayMold`, `Viral`, and `Wilt`.
-- The best model uses fewer steps or smaller attention windows without losing diagnostic performance.
-- Learning curves improve on validation data.
