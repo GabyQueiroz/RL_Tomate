@@ -3,29 +3,29 @@
 This project implements a Reinforcement Learning experiment with Proximal Policy
 Optimization (PPO) for the `Tomato Disease Dataset`. The task is formulated as
 budgeted active visual inspection: an agent moves and resizes an attention window over
-the image, receives reward from expert XML bounding-box annotations, and must classify
-the disease as `GrayMold`, `Viral`, or `Wilt`.
+the image, receives reward from expert XML bounding-box annotations, and classifies the
+disease as `GrayMold`, `Viral`, or `Wilt`.
+
+The current improved version adds an auxiliary visual-evidence classifier trained only
+on the training split. Its class probabilities are appended to the PPO state, while PPO
+still learns the active inspection policy and the attention trajectory.
+
+## Latest Paper Run
+
+```powershell
+python .\tomato_ppo_experiments.py --dataset ".\Tomato Disease Dataset" --output ".\runs\tomato_ppo_paper_run_improved" --timesteps 50000 --eval-freq 5000 --eval-episodes 100 --variants localization balanced efficient --n-envs 4 --image-size 64 --cache-side 256 --preload-images --n-steps 128 --n-epochs 4 --aux-crops-per-image 3
+```
+
+Best result from the latest run:
+
+| Variant | Accuracy | Macro-F1 | Mean best IoU | Steps | Window area |
+|---|---:|---:|---:|---:|---:|
+| PPO-efficient | 0.9286 | 0.9337 | 0.5195 | 6.0 | 0.1489 |
 
 ## Quick Smoke Test
 
-Use this to verify that the code runs end to end:
-
 ```powershell
-python .\tomato_ppo_experiments.py --dataset ".\Tomato Disease Dataset" --output ".\runs\smoke_test_en" --timesteps 8 --eval-freq 1000 --eval-episodes 1 --test-episodes 3 --variants localization --n-envs 1 --image-size 32 --cache-side 128 --n-steps 8 --n-epochs 1
-```
-
-## Main Experiment
-
-Use this for a complete but moderate comparison:
-
-```powershell
-python .\tomato_ppo_experiments.py --dataset ".\Tomato Disease Dataset" --output ".\runs\tomato_ppo_budgeted_decision_en" --timesteps 512 --eval-freq 256 --eval-episodes 15 --variants localization balanced efficient --n-envs 4 --image-size 48 --cache-side 192 --n-steps 64 --n-epochs 2
-```
-
-For paper-grade results, increase the training budget:
-
-```powershell
-python .\tomato_ppo_experiments.py --dataset ".\Tomato Disease Dataset" --output ".\runs\tomato_ppo_paper_run" --timesteps 50000 --eval-freq 2500 --eval-episodes 100 --variants localization balanced efficient --n-envs 4 --image-size 64 --cache-side 256 --n-steps 128 --n-epochs 4
+python .\tomato_ppo_experiments.py --dataset ".\Tomato Disease Dataset" --output ".\runs\smoke_improved" --timesteps 32 --eval-freq 1000 --eval-episodes 3 --test-episodes 6 --variants efficient --n-envs 1 --image-size 48 --cache-side 192 --n-steps 16 --n-epochs 1 --aux-crops-per-image 2
 ```
 
 ## Generated Artifacts
@@ -35,11 +35,12 @@ Each run creates an output folder under `runs/` containing:
 - `metadata.csv`: image paths, splits, classes, and normalized bounding boxes.
 - `tables/dataset_split_counts.csv`: train/validation/test distribution.
 - `tables/object_counts.csv`: XML label counts.
+- `tables/auxiliary_classifier_metrics.csv`: auxiliary classifier performance.
+- `tables/classification_baselines.csv`: majority-class and random baselines.
+- `tables/ppo_vs_baselines.csv`: direct comparison between PPO variants and baselines.
 - `tables/ppo_variant_comparison.csv`: final PPO variant comparison.
-- `tables/ppo_variant_comparison.tex`: LaTeX-ready results table.
-- `tables/learning_curves.csv`: validation history during training.
-- `figures/*.png`: learning curves, final comparisons, dataset statistics, and
-  confusion matrices.
+- `tables/per_class_metrics_<variant>.csv`: per-class precision, recall, and F1-score.
+- `figures/*.png`: learning curves, final comparisons, dataset statistics, confusion matrices, and qualitative attention examples.
 - `models/<variant>/model_final.zip`: final PPO model for each variant.
 - `models/<variant>/test_episode_metrics.csv`: per-episode test metrics.
 - `experiment_summary.json`: run summary and selected best variant.
@@ -48,5 +49,23 @@ Each run creates an output folder under `runs/` containing:
 
 - `localization`: emphasizes IoU improvement with expert bounding boxes.
 - `balanced`: combines IoU, classification reward, and a small step penalty.
-- `efficient`: penalizes large windows and extra steps to encourage economical visual
-  inspection.
+- `efficient`: penalizes large windows and extra steps to encourage economical visual inspection.
+
+## Article Files
+
+- `artigo_metodologia_resultados_atualizado.tex`: methodology and results in Portuguese, ready to adapt into the paper.
+- `metodologia_ppo_tomate.tex`: detailed PPO methodology draft.
+- `RELATORIO_RL_TOMATE.md`: updated summary of the latest experiment.
+
+## How to Judge the Model
+
+Use the held-out test metrics in `tables/ppo_vs_baselines.csv` and
+`tables/ppo_variant_comparison.csv`.
+
+Strong evidence that the model is useful:
+
+- Macro-F1 is above majority-class and random baselines.
+- Mean best IoU improves, showing alignment with expert annotations.
+- Per-class F1 is non-zero and balanced across `GrayMold`, `Viral`, and `Wilt`.
+- The best model uses fewer steps or smaller attention windows without losing diagnostic performance.
+- Learning curves improve on validation data.

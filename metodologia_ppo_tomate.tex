@@ -1,0 +1,97 @@
+\section{Metodologia}
+
+Este trabalho propõe um método de inspeção visual ativa para o diagnóstico de doenças
+em tomateiro utilizando Aprendizado por Reforço Profundo. O diagnóstico é modelado como
+uma sequência de decisões: um agente controla uma janela de atenção, desloca e
+redimensiona essa janela sobre a imagem e, ao final da inspeção, emite uma decisão
+entre \textit{GrayMold}, \textit{Viral} e \textit{Wilt}. O ambiente foi implementado em
+Gymnasium, e o agente foi treinado com Proximal Policy Optimization (PPO)
+\cite{schulman2017ppo}.
+
+\subsection{Base de Dados}
+
+Foi utilizado o \textit{Tomato Disease Dataset}, composto por 1.026 imagens e 3.167
+caixas delimitadoras anotadas em formato Pascal VOC. As anotações indicam regiões
+sintomáticas em folhas, frutos e caules. O conjunto foi dividido de forma estratificada
+em treino, validação e teste.
+
+\subsection{Formulação como MDP}
+
+O problema foi modelado como um Processo de Decisão de Markov (MDP),
+$M=(S,A,P,R,\gamma)$ \cite{sutton2018,puterman1994}. Cada episódio corresponde à
+inspeção de uma imagem. A janela de atenção é representada por:
+
+\begin{equation}
+w_t = (c_x, c_y, l, h),
+\end{equation}
+
+\noindent em que $c_x$ e $c_y$ são as coordenadas normalizadas do centro da janela, e
+$l$ e $h$ sua largura e altura. Os valores são restringidos ao intervalo $[0,1]$, com
+$0{,}10 \leq l,h \leq 1{,}00$.
+
+\subsection{Estado e Evidência Visual}
+
+O estado combina informações espaciais da janela, progresso temporal do episódio, valor
+atual de interseção sobre união ($IoU_t$), descritores visuais do recorte observado e
+probabilidades diagnósticas produzidas por um classificador auxiliar treinado apenas no
+conjunto de treino. Esse classificador utiliza estatísticas RGB, intensidade em escala
+de cinza, bordas Sobel e histogramas HSV. Sua função é fornecer evidência visual
+compacta ao PPO, sem substituir a política de inspeção ativa.
+
+O alinhamento entre a janela atual $B_t$ e as caixas anotadas $G_i$ é medido por:
+
+\begin{equation}
+IoU_t = \max_i \frac{|B_t \cap G_i|}{|B_t \cup G_i|}.
+\end{equation}
+
+\subsection{Ações e Recompensa}
+
+O espaço de ações é discreto e contém 13 ações: dez ações controlam a janela de
+atenção, incluindo deslocamentos, zoom e alteração de largura e altura; as três ações
+restantes correspondem às classes diagnósticas. Caso o limite de passos seja atingido
+sem uma classificação explícita, a decisão final é definida pela evidência visual da
+janela atual.
+
+A recompensa foi proposta para combinar localização, classificação e custo de inspeção:
+
+\begin{equation}
+R_t = \alpha \Delta IoU_t + \beta IoU_t - \lambda C_t + R_{cls},
+\end{equation}
+
+\noindent em que $\Delta IoU_t = IoU_t - IoU_{t-1}$, $C_t$ representa o custo de
+inspeção e $R_{cls}$ corresponde à recompensa terminal de classificação. Predições
+corretas recebem recompensa positiva, predições incorretas são penalizadas, e decisões
+com maior IoU final recebem bonificação adicional.
+
+Foram avaliadas três variantes: \textit{PPO-localization}, com foco no aumento do IoU;
+\textit{PPO-balanced}, que combina localização e classificação; e
+\textit{PPO-efficient}, que penaliza janelas grandes e utiliza menor orçamento de
+passos.
+
+\subsection{Treinamento e Avaliação}
+
+A política PPO foi implementada como uma MLP com duas camadas ocultas de 64 neurônios.
+Os experimentos utilizaram quatro ambientes paralelos, \texttt{n\_steps}=128,
+\texttt{batch\_size}=128, \texttt{n\_epochs}=4, \texttt{clip\_range}=0{,}2 e
+\texttt{ent\_coef}=0{,}02. Cada variante foi treinada por 50.000 timesteps.
+
+\begin{table}[htbp]
+\centering
+\caption{Configurações das variantes PPO avaliadas.}
+\label{tab:ppo_variants}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Variante} & \textbf{Foco} & \textbf{Passos} & \textbf{Taxa de aprendizado} & $\boldsymbol{\gamma}$ \\
+\hline
+\textit{PPO-localization} & Localização & 8 & $3{,}0 \times 10^{-4}$ & 0{,}95 \\
+\textit{PPO-balanced} & Localização + classificação & 8 & $2{,}5 \times 10^{-4}$ & 0{,}96 \\
+\textit{PPO-efficient} & Eficiência de inspeção & 6 & $2{,}5 \times 10^{-4}$ & 0{,}94 \\
+\hline
+\end{tabular}
+\end{table}
+
+A avaliação final foi realizada no conjunto de teste usando acurácia, Macro-F1, taxa de
+classificação, melhor IoU médio, IoU final médio, número médio de passos e área média
+da janela. A Macro-F1 foi adotada como métrica principal devido ao desbalanceamento das
+classes. As variantes foram comparadas com três baselines: classe majoritária,
+aleatório uniforme e aleatório estratificado.

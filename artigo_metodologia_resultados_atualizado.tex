@@ -1,0 +1,254 @@
+\section{Metodologia}
+
+Este trabalho propõe um método de inspeção visual ativa para o diagnóstico de doenças
+em tomateiro utilizando Aprendizado por Reforço Profundo. Diferentemente de abordagens
+que classificam a imagem completa em uma única etapa, o método estrutura o diagnóstico
+como uma sequência de decisões. Um agente controla uma janela de atenção, desloca e
+redimensiona essa janela sobre a imagem e, ao final da inspeção, emite uma decisão
+diagnóstica entre \textit{GrayMold}, \textit{Viral} e \textit{Wilt}. O ambiente foi
+implementado em Gymnasium, e o treinamento foi realizado com Proximal Policy
+Optimization (PPO) \cite{schulman2017ppo}.
+
+\subsection{Base de Dados}
+
+Foi utilizado o \textit{Tomato Disease Dataset}, composto por 1.026 imagens de plantas
+de tomate distribuídas em três classes: \textit{GrayMold}, \textit{Viral} e
+\textit{Wilt}. Cada imagem possui um arquivo XML no formato Pascal VOC, totalizando
+3.167 caixas delimitadoras associadas a regiões sintomáticas em folhas, frutos e
+caules. As anotações foram incorporadas ao processo de aprendizagem por meio do cálculo
+da sobreposição entre a janela de atenção do agente e as regiões anotadas. O conjunto
+foi dividido de forma estratificada em treino, validação e teste.
+
+\subsection{Formulação como MDP}
+
+O problema foi modelado como um Processo de Decisão de Markov (MDP), definido por
+$M = (S, A, P, R, \gamma)$, em que $S$ representa o espaço de estados, $A$ o espaço de
+ações, $P$ a dinâmica de transição, $R$ a função de recompensa e $\gamma$ o fator de
+desconto \cite{sutton2018,puterman1994}. Cada episódio corresponde à inspeção de uma
+única imagem. O episódio termina quando o agente escolhe uma ação de classificação ou
+quando atinge o limite máximo de passos.
+
+A inspeção é realizada por uma janela de atenção:
+
+\begin{equation}
+w_t = (c_x, c_y, l, h),
+\end{equation}
+
+\noindent em que $c_x$ e $c_y$ representam as coordenadas normalizadas do centro da
+janela, e $l$ e $h$ representam sua largura e altura. Os valores são mantidos no
+intervalo $[0,1]$, com restrição $0{,}10 \leq l,h \leq 1{,}00$.
+
+\subsection{Estado, Evidência Visual e IoU}
+
+O estado observado pelo agente combina informações espaciais da janela de atenção,
+progresso temporal do episódio, valor atual de interseção sobre união ($IoU_t$),
+descritores visuais do recorte observado e probabilidades diagnósticas produzidas por
+um classificador auxiliar treinado apenas com o conjunto de treino. Esse classificador
+auxiliar utiliza os mesmos descritores visuais do recorte, incluindo estatísticas RGB,
+escala de cinza, bordas Sobel e histogramas HSV. Sua função é fornecer ao agente uma
+estimativa compacta da evidência visual presente na janela atual, sem substituir a
+política PPO de inspeção.
+
+A qualidade espacial da atenção é medida pelo maior IoU entre a janela atual $B_t$ e
+as caixas anotadas $G_i$:
+
+\begin{equation}
+IoU_t = \max_i \frac{|B_t \cap G_i|}{|B_t \cup G_i|}.
+\end{equation}
+
+Esse valor indica o quanto a região observada está alinhada com as áreas sintomáticas
+anotadas por especialistas.
+
+\subsection{Espaço de Ações}
+
+O espaço de ações é discreto e contém 13 ações. Dez ações controlam a janela de
+atenção: deslocamento para esquerda, direita, cima e baixo; aumento e redução da
+escala; aumento e redução da largura; e aumento e redução da altura. As três ações
+restantes correspondem às decisões diagnósticas: \textit{GrayMold}, \textit{Viral} e
+\textit{Wilt}. Caso o agente não selecione uma ação de classificação antes do fim do
+orçamento de passos, a decisão final é definida pela evidência diagnóstica da janela
+atual. Assim, todos os episódios produzem uma classificação.
+
+\subsection{Função de Recompensa}
+
+A recompensa foi proposta neste trabalho para combinar localização visual, diagnóstico
+correto e custo de inspeção. Sua forma geral é:
+
+\begin{equation}
+R_t = \alpha \Delta IoU_t + \beta IoU_t - \lambda C_t + R_{cls},
+\end{equation}
+
+\noindent em que $\Delta IoU_t = IoU_t - IoU_{t-1}$, $C_t$ representa o custo de
+inspeção e $R_{cls}$ é a recompensa terminal associada à classificação. O termo
+$\Delta IoU_t$ favorece ações que aproximam a janela das regiões anotadas, enquanto
+$IoU_t$ reforça estados em que a janela já se encontra sobre regiões sintomáticas. A
+classificação correta recebe recompensa positiva, e classificações incorretas são
+penalizadas. Também foi adicionada uma bonificação proporcional ao IoU final.
+
+Foram avaliadas três variantes: \textit{PPO-localization}, com foco no aumento do IoU;
+\textit{PPO-balanced}, que combina localização e classificação; e
+\textit{PPO-efficient}, que inclui penalização adicional para janelas grandes e opera
+com menor orçamento de passos.
+
+\subsection{Treinamento com PPO}
+
+O agente foi treinado com PPO, que otimiza uma política parametrizada
+$\pi_\theta(a|s)$ por meio de uma função objetivo com truncamento por \textit{clip},
+reduzindo atualizações excessivas da política \cite{schulman2017ppo}. A política foi
+implementada como uma MLP com duas camadas ocultas de 64 neurônios. A saída da rede é
+uma distribuição categórica sobre as 13 ações. Durante o treinamento, as ações foram
+amostradas estocasticamente; durante a avaliação, foi utilizada a ação de maior
+probabilidade.
+
+Os experimentos utilizaram quatro ambientes paralelos, \texttt{n\_steps}=128,
+\texttt{batch\_size}=128, \texttt{n\_epochs}=4, \texttt{clip\_range}=0{,}2 e
+\texttt{ent\_coef}=0{,}02. O recorte visual foi redimensionado para $64 \times 64$
+pixels. Cada variante foi treinada por 50.000 timesteps.
+
+\begin{table}[htbp]
+\centering
+\caption{Configurações das variantes PPO avaliadas.}
+\label{tab:ppo_variants}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Variante} & \textbf{Foco} & \textbf{Passos} & \textbf{Taxa de aprendizado} & $\boldsymbol{\gamma}$ \\
+\hline
+\textit{PPO-localization} & Localização & 8 & $3{,}0 \times 10^{-4}$ & 0{,}95 \\
+\textit{PPO-balanced} & Localização + classificação & 8 & $2{,}5 \times 10^{-4}$ & 0{,}96 \\
+\textit{PPO-efficient} & Eficiência de inspeção & 6 & $2{,}5 \times 10^{-4}$ & 0{,}94 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Avaliação}
+
+A avaliação final foi realizada no conjunto de teste com política determinística. As
+métricas utilizadas foram acurácia, Macro-F1, taxa de classificação, melhor IoU médio,
+IoU final médio, número médio de passos e área média da janela. A Macro-F1 foi adotada
+como métrica principal devido ao desbalanceamento das classes. Como referência, foram
+utilizados três baselines: classe majoritária, aleatório uniforme e aleatório
+estratificado. A melhor variante foi selecionada por maior Macro-F1, seguida por maior
+IoU médio e maior recompensa acumulada.
+
+\section{Resultados e Discussão}
+
+\subsection{Desempenho do Classificador Auxiliar}
+
+O classificador auxiliar foi utilizado como estimador compacto da evidência visual
+presente na janela de atenção. No conjunto de teste, esse classificador obteve acurácia
+de 0,8831 e Macro-F1 de 0,8592, indicando que os descritores visuais extraídos dos
+recortes fornecem informação discriminativa para o diagnóstico. Esses valores servem
+como referência para interpretar a política PPO, que utiliza essa evidência em conjunto
+com o estado espacial e com as recompensas de inspeção.
+
+\begin{table}[htbp]
+\centering
+\caption{Desempenho do classificador auxiliar nos subconjuntos de treino, validação e teste.}
+\label{tab:aux_classifier}
+\begin{tabular}{lcc}
+\hline
+\textbf{Subconjunto} & \textbf{Acurácia} & \textbf{Macro-F1} \\
+\hline
+Treino & 0,9276 & 0,9075 \\
+Validação & 0,9026 & 0,8632 \\
+Teste & 0,8831 & 0,8592 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Comparação com Baselines}
+
+A Tabela~\ref{tab:ppo_baselines} apresenta a comparação entre as variantes PPO e os
+baselines. Todas as variantes PPO superaram os baselines em Macro-F1. A variante
+\textit{PPO-efficient} obteve o melhor resultado, com acurácia de 0,9286 e Macro-F1 de
+0,9337.
+
+\begin{table}[htbp]
+\centering
+\caption{Comparação entre as variantes PPO e os baselines no conjunto de teste.}
+\label{tab:ppo_baselines}
+\begin{tabular}{lccc}
+\hline
+\textbf{Método} & \textbf{Acurácia} & \textbf{Macro-F1} & \textbf{Melhor IoU médio} \\
+\hline
+Classe majoritária & 0,5130 & 0,2260 & -- \\
+Aleatório uniforme & 0,3442 & 0,3070 & -- \\
+Aleatório estratificado & 0,4675 & 0,3588 & -- \\
+\textit{PPO-localization} & 0,9026 & 0,8731 & 0,4148 \\
+\textit{PPO-balanced} & 0,9026 & 0,8731 & 0,4148 \\
+\textit{PPO-efficient} & \textbf{0,9286} & \textbf{0,9337} & \textbf{0,5195} \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Comparação entre Variantes PPO}
+
+A Tabela~\ref{tab:ppo_results} mostra que a variante \textit{PPO-efficient} apresentou
+o melhor equilíbrio entre diagnóstico e inspeção visual. Mesmo operando com menor
+orçamento de passos, essa variante obteve o maior melhor IoU médio e a menor área média
+de janela. Em comparação com as variantes \textit{PPO-localization} e
+\textit{PPO-balanced}, a \textit{PPO-efficient} reduziu a área média observada de
+0,2044 para 0,1489 e elevou o melhor IoU médio de 0,4148 para 0,5195.
+
+\begin{table}[htbp]
+\centering
+\caption{Desempenho das variantes PPO no conjunto de teste.}
+\label{tab:ppo_results}
+\begin{tabular}{lcccccc}
+\hline
+\textbf{Variante} & \textbf{Acurácia} & \textbf{Macro-F1} & \textbf{IoU} & \textbf{Passos} & \textbf{Área} & \textbf{Recompensa} \\
+\hline
+\textit{PPO-localization} & 0,9026 & 0,8731 & 0,4148 & 8,0 & 0,2044 & 3,2097 \\
+\textit{PPO-balanced} & 0,9026 & 0,8731 & 0,4148 & 8,0 & 0,2044 & 3,7034 \\
+\textit{PPO-efficient} & \textbf{0,9286} & \textbf{0,9337} & \textbf{0,5195} & \textbf{6,0} & \textbf{0,1489} & \textbf{3,7119} \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Análise por Classe}
+
+A Tabela~\ref{tab:per_class_metrics_efficient} apresenta as métricas por classe da
+variante \textit{PPO-efficient}. O modelo obteve F1-score de 0,9500 para
+\textit{GrayMold}, 0,9302 para \textit{Viral} e 0,9209 para \textit{Wilt}. Esses
+resultados indicam que o ganho de desempenho não ficou restrito à classe majoritária.
+
+\begin{table}[htbp]
+\centering
+\caption{Métricas por classe da variante \textit{PPO-efficient} no conjunto de teste.}
+\label{tab:per_class_metrics_efficient}
+\begin{tabular}{lrrrr}
+\hline
+\textbf{Classe} & \textbf{Precisão} & \textbf{Revocação} & \textbf{F1-score} & \textbf{Suporte} \\
+\hline
+\textit{GrayMold} & 0,9048 & 1,0000 & 0,9500 & 19 \\
+\textit{Viral} & 0,8824 & 0,9836 & 0,9302 & 61 \\
+\textit{Wilt} & 0,9846 & 0,8649 & 0,9209 & 74 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Inspeção Visual Ativa}
+
+Além do desempenho diagnóstico, a variante \textit{PPO-efficient} apresentou o melhor
+comportamento espacial. O melhor IoU médio foi 0,5195, com área média de janela de
+0,1489. Isso mostra que o agente foi capaz de produzir decisões mantendo a atenção em
+uma fração reduzida da imagem. A Figura~\ref{fig:qualitative_attention_efficient}
+apresenta exemplos qualitativos da trajetória de inspeção do agente em comparação com
+as anotações especialistas.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/qualitative_attention_examples_efficient.png}
+\caption{Exemplos qualitativos da inspeção visual ativa realizada pela variante
+\textit{PPO-efficient}. A primeira coluna mostra a imagem original, a segunda apresenta
+as caixas delimitadoras anotadas por especialistas em vermelho, e a terceira mostra a
+trajetória da janela de atenção do agente em azul e sua janela final em ciano.}
+\label{fig:qualitative_attention_efficient}
+\end{figure}
+
+Os resultados sugerem que a penalização por área e o menor orçamento de passos
+contribuíram para uma política de inspeção mais seletiva. Assim, a principal vantagem
+da variante \textit{PPO-efficient} não está apenas na classificação, mas na combinação
+entre desempenho diagnóstico, melhor alinhamento espacial com as anotações e menor
+custo de inspeção.
+

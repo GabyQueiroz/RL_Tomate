@@ -18,8 +18,11 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from gymnasium import spaces
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
@@ -82,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--test-episodes",
         default=0,
         type=int,
-        help="0 usa todo o conjunto de teste; valores positivos limitam a avaliacao final.",
+        help="0 uses the full test set; positive values limit final evaluation episodes.",
     )
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument(
@@ -97,6 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preload-images", action="store_true")
     parser.add_argument("--n-steps", default=128, type=int)
     parser.add_argument("--n-epochs", default=4, type=int)
+    parser.add_argument("--aux-crops-per-image", default=2, type=int)
     return parser.parse_args()
 
 
@@ -225,6 +229,131 @@ def preload_images(metadata: pd.DataFrame, max_side: int = 384) -> dict[str, np.
     return cache
 
 
+def extract_visual_features(crop: np.ndarray) -> np.ndarray:
+    rgb = crop.astype(np.float32) / 255.0
+    mean = rgb.mean(axis=(0, 1))
+    std = rgb.std(axis=(0, 1))
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    hist_parts = []
+    for channel in range(3):
+        hist = cv2.calcHist([hsv], [channel], None, [8], [0, 256]).flatten()
+        hist = hist / max(1.0, hist.sum())
+        hist_parts.extend((hist * 2.0 - 1.0).tolist())
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    sobel = np.sqrt(sobel_x * sobel_x + sobel_y * sobel_y)
+    return np.array(
+        [
+            *(mean * 2 - 1),
+            *(std * 2 - 1),
+            gray.mean() * 2 - 1,
+            gray.std() * 2 - 1,
+            np.clip(sobel.mean(), 0, 1) * 2 - 1,
+            np.clip(sobel.std(), 0, 1) * 2 - 1,
+            *hist_parts,
+        ],
+        dtype=np.float32,
+    )
+
+
+def crop_normalized_box(image: np.ndarray, box: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    x1 = int(np.floor(box[0] * width))
+    y1 = int(np.floor(box[1] * height))
+    x2 = int(np.ceil(box[2] * width))
+    y2 = int(np.ceil(box[3] * height))
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(x1 + 1, min(width, x2))
+    y2 = max(y1 + 1, min(height, y2))
+    return image[y1:y2, x1:x2]
+
+
+def load_resized_image(
+    image_path: str, image_cache: dict[str, np.ndarray], cache_side: int
+) -> np.ndarray:
+    cached = image_cache.get(image_path)
+    if cached is not None:
+        return cached
+    image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    height, width = image.shape[:2]
+    scale = min(1.0, cache_side / max(height, width))
+    if scale < 1.0:
+        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        image = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+    image_cache[image_path] = image
+    return image
+
+
+def train_auxiliary_classifier(
+    metadata: pd.DataFrame,
+    image_cache: dict[str, np.ndarray],
+    cache_side: int,
+    image_size: int,
+    seed: int,
+    crops_per_image: int,
+    output_dir: Path,
+):
+    train_df = metadata[metadata["split"] == "train"].reset_index(drop=True)
+    rng = np.random.default_rng(seed)
+    features = []
+    labels = []
+    for _, row in train_df.iterrows():
+        image = load_resized_image(row["image_path"], image_cache, cache_side)
+        boxes = np.array(json.loads(row["boxes_json"]), dtype=np.float32)
+        crops = [image]
+        for box in boxes[: max(1, crops_per_image)]:
+            crops.append(crop_normalized_box(image, box))
+        for _ in range(max(0, crops_per_image - len(boxes))):
+            box = boxes[int(rng.integers(0, len(boxes)))]
+            jitter = rng.normal(0.0, 0.04, size=4)
+            jittered = np.clip(box + jitter, 0.0, 1.0)
+            if jittered[2] <= jittered[0] or jittered[3] <= jittered[1]:
+                jittered = box
+            crops.append(crop_normalized_box(image, jittered))
+        for crop in crops:
+            crop = cv2.resize(crop, (image_size, image_size), interpolation=cv2.INTER_AREA)
+            features.append(extract_visual_features(crop))
+            labels.append(int(row["label"]))
+    clf = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            random_state=seed,
+        ),
+    )
+    clf.fit(np.vstack(features), np.array(labels))
+    baseline_rows = []
+    for split in ["train", "val", "test"]:
+        split_df = metadata[metadata["split"] == split].reset_index(drop=True)
+        x_split = []
+        y_split = []
+        for _, row in split_df.iterrows():
+            image = load_resized_image(row["image_path"], image_cache, cache_side)
+            crop = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_AREA)
+            x_split.append(extract_visual_features(crop))
+            y_split.append(int(row["label"]))
+        pred = clf.predict(np.vstack(x_split))
+        baseline_rows.append(
+            {
+                "split": split,
+                "accuracy": float(accuracy_score(y_split, pred)),
+                "macro_f1": float(
+                    f1_score(y_split, pred, labels=list(range(len(DISEASES))), average="macro")
+                ),
+            }
+        )
+    pd.DataFrame(baseline_rows).to_csv(
+        output_dir / "tables" / "auxiliary_classifier_metrics.csv", index=False
+    )
+    return clf
+
+
 def to_box(cx: float, cy: float, w: float, h: float) -> np.ndarray:
     return np.array(
         [
@@ -265,6 +394,7 @@ class TomatoAttentionEnv(gym.Env):
         class_balanced: bool = True,
         image_cache: dict[str, np.ndarray] | None = None,
         cache_side: int = 384,
+        auxiliary_classifier: Any | None = None,
     ) -> None:
         super().__init__()
         self.df = dataframe.reset_index(drop=True)
@@ -273,6 +403,7 @@ class TomatoAttentionEnv(gym.Env):
         self.class_balanced = class_balanced
         self.image_cache = image_cache if image_cache is not None else {}
         self.cache_side = cache_side
+        self.auxiliary_classifier = auxiliary_classifier
         self.rng = random.Random(seed)
         self.np_rng = np.random.default_rng(seed)
         self.by_class = {
@@ -281,7 +412,7 @@ class TomatoAttentionEnv(gym.Env):
         }
         self.action_space = spaces.Discrete(13)
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(40,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(43,), dtype=np.float32
         )
         self.current: pd.Series | None = None
         self.image: np.ndarray | None = None
@@ -322,17 +453,7 @@ class TomatoAttentionEnv(gym.Env):
         cached = self.image_cache.get(image_path)
         if cached is not None:
             return cached
-        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            raise FileNotFoundError(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        height, width = image.shape[:2]
-        scale = min(1.0, self.cache_side / max(height, width))
-        if scale < 1.0:
-            new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-            image = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
-        self.image_cache[image_path] = image
-        return image
+        return load_resized_image(image_path, self.image_cache, self.cache_side)
 
     def step(self, action: int):
         assert self.gt_boxes is not None
@@ -351,7 +472,7 @@ class TomatoAttentionEnv(gym.Env):
 
         if self.steps >= self.variant.max_steps and not terminated:
             terminated = True
-            predicted = action % len(DISEASES)
+            predicted = self._diagnostic_prediction()
             correct = predicted == self.label
 
         current_box = to_box(self.cx, self.cy, self.w, self.h)
@@ -415,7 +536,7 @@ class TomatoAttentionEnv(gym.Env):
             reward = 2.5 * delta_iou + 0.45 * current_iou
         reward -= self.variant.step_penalty
         if terminated:
-            reward += 1.5 if correct else -1.0
+            reward += 3.0 if correct else -2.0
             reward += 0.7 * current_iou
             if self.variant.reward_mode == "efficient":
                 reward += max(0.0, 0.25 - area)
@@ -425,19 +546,8 @@ class TomatoAttentionEnv(gym.Env):
         assert self.image is not None
         crop = self._crop_attention()
         crop = cv2.resize(crop, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
-        rgb = crop.astype(np.float32) / 255.0
-        mean = rgb.mean(axis=(0, 1))
-        std = rgb.std(axis=(0, 1))
-        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
-        hist_parts = []
-        for channel in range(3):
-            hist = cv2.calcHist([hsv], [channel], None, [8], [0, 256]).flatten()
-            hist = hist / max(1.0, hist.sum())
-            hist_parts.extend((hist * 2.0 - 1.0).tolist())
-        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-        sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        sobel = np.sqrt(sobel_x * sobel_x + sobel_y * sobel_y)
+        visual = extract_visual_features(crop)
+        diagnostic_probs = self._diagnostic_probs(visual)
         state = np.array(
             [
                 self.cx * 2 - 1,
@@ -449,19 +559,20 @@ class TomatoAttentionEnv(gym.Env):
             ],
             dtype=np.float32,
         )
-        visual = np.array(
-            [
-                *(mean * 2 - 1),
-                *(std * 2 - 1),
-                gray.mean() * 2 - 1,
-                gray.std() * 2 - 1,
-                np.clip(sobel.mean(), 0, 1) * 2 - 1,
-                np.clip(sobel.std(), 0, 1) * 2 - 1,
-                *hist_parts,
-            ],
-            dtype=np.float32,
-        )
-        return np.concatenate([state, visual]).astype(np.float32)
+        return np.concatenate([state, visual, diagnostic_probs * 2.0 - 1.0]).astype(np.float32)
+
+    def _diagnostic_probs(self, visual: np.ndarray) -> np.ndarray:
+        if self.auxiliary_classifier is None:
+            return np.full(len(DISEASES), 1.0 / len(DISEASES), dtype=np.float32)
+        probs = self.auxiliary_classifier.predict_proba(visual.reshape(1, -1))[0]
+        return probs.astype(np.float32)
+
+    def _diagnostic_prediction(self) -> int:
+        assert self.image is not None
+        crop = self._crop_attention()
+        crop = cv2.resize(crop, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+        visual = extract_visual_features(crop)
+        return int(np.argmax(self._diagnostic_probs(visual)))
 
     def _crop_attention(self) -> np.ndarray:
         assert self.image is not None
@@ -483,6 +594,7 @@ def make_env(
     image_size: int,
     image_cache: dict[str, np.ndarray] | None,
     cache_side: int,
+    auxiliary_classifier: Any | None,
 ):
     def _factory():
         return Monitor(
@@ -493,6 +605,7 @@ def make_env(
                 image_size=image_size,
                 image_cache=image_cache,
                 cache_side=cache_side,
+                auxiliary_classifier=auxiliary_classifier,
             )
         )
 
@@ -508,6 +621,7 @@ def evaluate_policy(
     image_size: int,
     image_cache: dict[str, np.ndarray] | None,
     cache_side: int,
+    auxiliary_classifier: Any | None,
 ) -> pd.DataFrame:
     env = TomatoAttentionEnv(
         df,
@@ -517,6 +631,7 @@ def evaluate_policy(
         class_balanced=False,
         image_cache=image_cache,
         cache_side=cache_side,
+        auxiliary_classifier=auxiliary_classifier,
     )
     rows = []
     for episode in range(episodes):
@@ -561,6 +676,7 @@ class ResearchEvalCallback(BaseCallback):
         image_size: int,
         image_cache: dict[str, np.ndarray] | None,
         cache_side: int,
+        auxiliary_classifier: Any | None,
     ) -> None:
         super().__init__()
         self.val_df = val_df
@@ -572,6 +688,7 @@ class ResearchEvalCallback(BaseCallback):
         self.image_size = image_size
         self.image_cache = image_cache
         self.cache_side = cache_side
+        self.auxiliary_classifier = auxiliary_classifier
         self.rows: list[dict[str, Any]] = []
         self.last_eval_timestep = 0
 
@@ -588,6 +705,7 @@ class ResearchEvalCallback(BaseCallback):
             image_size=self.image_size,
             image_cache=self.image_cache,
             cache_side=self.cache_side,
+            auxiliary_classifier=self.auxiliary_classifier,
         )
         row = summarize_eval(eval_df)
         row["timesteps"] = self.num_timesteps
@@ -630,7 +748,7 @@ def plot_learning_curves(all_curves: pd.DataFrame, output_dir: Path) -> None:
     metrics = [
         ("mean_reward", "Mean reward"),
         ("accuracy_classified", "Accuracy on classified episodes"),
-        ("macro_f1_classified", "Macro-F1 entre episodios classificados"),
+        ("macro_f1_classified", "Macro-F1 on classified episodes"),
         ("mean_best_iou", "Mean best IoU"),
     ]
     for metric, ylabel in metrics:
@@ -704,6 +822,202 @@ def write_latex_table(summary: pd.DataFrame, output_path: Path) -> None:
     output_path.write_text(latex, encoding="utf-8")
 
 
+def write_classification_baselines(
+    metadata: pd.DataFrame, output_dir: Path, seed: int
+) -> pd.DataFrame:
+    train_df = metadata[metadata["split"] == "train"].reset_index(drop=True)
+    test_df = metadata[metadata["split"] == "test"].reset_index(drop=True)
+    y_test = test_df["label"].to_numpy()
+    labels = list(range(len(DISEASES)))
+    rng = np.random.default_rng(seed)
+    majority_label = int(train_df["label"].mode().iloc[0])
+    class_probs = (
+        train_df["label"].value_counts(normalize=True).sort_index().reindex(labels, fill_value=0)
+    ).to_numpy()
+    baselines = {
+        "majority_class": np.full_like(y_test, majority_label),
+        "uniform_random": rng.choice(labels, size=len(y_test), replace=True),
+        "stratified_random": rng.choice(labels, size=len(y_test), replace=True, p=class_probs),
+    }
+    rows = []
+    for name, pred in baselines.items():
+        rows.append(
+            {
+                "baseline": name,
+                "accuracy": float(accuracy_score(y_test, pred)),
+                "macro_f1": float(
+                    f1_score(y_test, pred, labels=labels, average="macro", zero_division=0)
+                ),
+            }
+        )
+    baseline_df = pd.DataFrame(rows)
+    baseline_df.to_csv(output_dir / "tables" / "classification_baselines.csv", index=False)
+    return baseline_df
+
+
+def write_per_class_metrics(eval_df: pd.DataFrame, variant_name: str, output_dir: Path) -> None:
+    report = classification_report(
+        eval_df["label"],
+        eval_df["predicted"],
+        labels=list(range(len(DISEASES))),
+        target_names=DISEASES,
+        output_dict=True,
+        zero_division=0,
+    )
+    rows = []
+    for disease in DISEASES:
+        rows.append(
+            {
+                "class": disease,
+                "precision": report[disease]["precision"],
+                "recall": report[disease]["recall"],
+                "f1_score": report[disease]["f1-score"],
+                "support": int(report[disease]["support"]),
+            }
+        )
+    per_class = pd.DataFrame(rows)
+    table_dir = output_dir / "tables"
+    per_class.to_csv(table_dir / f"per_class_metrics_{variant_name}.csv", index=False)
+    per_class.round(4).to_latex(
+        table_dir / f"per_class_metrics_{variant_name}.tex", index=False, escape=True
+    )
+    latex = [
+        "\\begin{table}[htbp]",
+        "\\centering",
+        f"\\caption{{Per-class metrics for PPO-{variant_name} on the test set.}}",
+        f"\\label{{tab:per_class_metrics_{variant_name}}}",
+        "\\begin{tabular}{lrrrr}",
+        "\\hline",
+        "\\textbf{Class} & \\textbf{Precision} & \\textbf{Recall} & \\textbf{F1-score} & \\textbf{Support} \\\\",
+        "\\hline",
+    ]
+    for _, row in per_class.iterrows():
+        latex.append(
+            f"{row['class']} & {row['precision']:.4f} & {row['recall']:.4f} & "
+            f"{row['f1_score']:.4f} & {int(row['support'])} \\\\"
+        )
+    latex.extend(["\\hline", "\\end{tabular}", "\\end{table}", ""])
+    (table_dir / f"per_class_metrics_{variant_name}_article.tex").write_text(
+        "\n".join(latex), encoding="utf-8"
+    )
+
+
+def generate_qualitative_attention_examples(
+    metadata: pd.DataFrame,
+    model: PPO,
+    variant: VariantConfig,
+    output_dir: Path,
+    image_size: int,
+    image_cache: dict[str, np.ndarray],
+    cache_side: int,
+    auxiliary_classifier: Any | None,
+    seed: int,
+) -> None:
+    test_df = metadata[metadata["split"] == "test"].reset_index(drop=True)
+    examples = []
+    for disease in DISEASES:
+        subset = test_df[test_df["disease"] == disease]
+        if subset.empty:
+            continue
+        row = subset.iloc[0]
+        env = TomatoAttentionEnv(
+            pd.DataFrame([row]),
+            variant=variant,
+            seed=seed,
+            image_size=image_size,
+            class_balanced=False,
+            image_cache=image_cache,
+            cache_side=cache_side,
+            auxiliary_classifier=auxiliary_classifier,
+        )
+        obs, _ = env.reset(seed=seed)
+        trajectory = []
+        done = False
+        last_info: dict[str, Any] = {}
+        while not done:
+            trajectory.append(to_box(env.cx, env.cy, env.w, env.h).copy())
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, terminated, truncated, info = env.step(int(action))
+            done = terminated or truncated
+            last_info = info
+        trajectory.append(to_box(env.cx, env.cy, env.w, env.h).copy())
+        examples.append((row, trajectory, last_info))
+    if not examples:
+        return
+
+    fig, axes = plt.subplots(len(examples), 3, figsize=(12, 4 * len(examples)))
+    if len(examples) == 1:
+        axes = np.expand_dims(axes, axis=0)
+    for row_idx, (row, trajectory, info) in enumerate(examples):
+        image = load_resized_image(row["image_path"], image_cache, 900)
+        height, width = image.shape[:2]
+        boxes = np.array(json.loads(row["boxes_json"]), dtype=np.float32)
+
+        axes[row_idx, 0].imshow(image)
+        axes[row_idx, 0].set_title(f"Original image\nTrue: {row['disease']}")
+        axes[row_idx, 0].axis("off")
+
+        axes[row_idx, 1].imshow(image)
+        for box in boxes:
+            x1, y1, x2, y2 = box[0] * width, box[1] * height, box[2] * width, box[3] * height
+            axes[row_idx, 1].add_patch(
+                plt.Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor="red", linewidth=2.5
+                )
+            )
+        axes[row_idx, 1].set_title("Expert XML annotations")
+        axes[row_idx, 1].axis("off")
+
+        axes[row_idx, 2].imshow(image)
+        for idx, box in enumerate(trajectory[:-1]):
+            x1, y1, x2, y2 = box[0] * width, box[1] * height, box[2] * width, box[3] * height
+            alpha = 0.18 + 0.45 * (idx / max(1, len(trajectory) - 1))
+            axes[row_idx, 2].add_patch(
+                plt.Rectangle(
+                    (x1, y1),
+                    x2 - x1,
+                    y2 - y1,
+                    fill=False,
+                    edgecolor="dodgerblue",
+                    linewidth=1.5,
+                    alpha=alpha,
+                )
+            )
+        final_box = trajectory[-1]
+        x1, y1, x2, y2 = (
+            final_box[0] * width,
+            final_box[1] * height,
+            final_box[2] * width,
+            final_box[3] * height,
+        )
+        axes[row_idx, 2].add_patch(
+            plt.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor="cyan", linewidth=3)
+        )
+        axes[row_idx, 2].set_title(
+            f"PPO-{variant.name} attention\nPred: {info.get('predicted_name')} | "
+            f"best IoU: {info.get('best_iou', 0.0):.3f}"
+        )
+        axes[row_idx, 2].axis("off")
+    plt.tight_layout()
+    fig_path = output_dir / "figures" / f"qualitative_attention_examples_{variant.name}.png"
+    plt.savefig(fig_path, dpi=220, bbox_inches="tight")
+    plt.close()
+    latex = (
+        "\\begin{figure}[htbp]\n"
+        "\\centering\n"
+        f"\\includegraphics[width=\\textwidth]{{figures/qualitative_attention_examples_{variant.name}.png}}\n"
+        f"\\caption{{Qualitative examples of active visual inspection performed by PPO-{variant.name}. "
+        "The first column shows the original image, the second column shows expert XML bounding boxes "
+        "in red, and the third column shows the PPO attention trajectory in blue and the final window "
+        "in cyan.}\n"
+        f"\\label{{fig:qualitative_attention_{variant.name}}}\n"
+        "\\end{figure}\n"
+    )
+    (output_dir / "figures" / f"qualitative_attention_examples_{variant.name}_article.tex").write_text(
+        latex, encoding="utf-8"
+    )
+
+
 def train_variant(
     variant: VariantConfig,
     metadata: pd.DataFrame,
@@ -716,6 +1030,7 @@ def train_variant(
     image_size: int,
     image_cache: dict[str, np.ndarray] | None,
     cache_side: int,
+    auxiliary_classifier: Any | None,
     n_steps: int,
     n_epochs: int,
     test_episodes: int,
@@ -735,6 +1050,7 @@ def train_variant(
                 image_size,
                 image_cache,
                 cache_side,
+                auxiliary_classifier,
             )
             for i in range(n_envs)
         ]
@@ -749,6 +1065,7 @@ def train_variant(
         image_size=image_size,
         image_cache=image_cache,
         cache_side=cache_side,
+        auxiliary_classifier=auxiliary_classifier,
     )
     model = PPO(
         "MlpPolicy",
@@ -781,6 +1098,7 @@ def train_variant(
         image_size=image_size,
         image_cache=image_cache,
         cache_side=cache_side,
+        auxiliary_classifier=auxiliary_classifier,
     )
     test_eval.to_csv(variant_dir / "test_episode_metrics.csv", index=False)
     summary = summarize_eval(test_eval)
@@ -817,7 +1135,17 @@ def main() -> None:
     metadata.groupby(["split", "disease"]).size().reset_index(name="n").to_csv(
         output_dir / "tables" / "dataset_split_counts.csv", index=False
     )
+    baseline_df = write_classification_baselines(metadata, output_dir, args.seed)
     image_cache = preload_images(metadata, max_side=args.cache_side) if args.preload_images else {}
+    auxiliary_classifier = train_auxiliary_classifier(
+        metadata=metadata,
+        image_cache=image_cache,
+        cache_side=args.cache_side,
+        image_size=args.image_size,
+        seed=args.seed,
+        crops_per_image=args.aux_crops_per_image,
+        output_dir=output_dir,
+    )
 
     summaries = []
     for variant_name in args.variants:
@@ -836,6 +1164,7 @@ def main() -> None:
                 image_size=args.image_size,
                 image_cache=image_cache,
                 cache_side=args.cache_side,
+                auxiliary_classifier=auxiliary_classifier,
                 n_steps=args.n_steps,
                 n_epochs=args.n_epochs,
                 test_episodes=args.test_episodes,
@@ -860,6 +1189,21 @@ def main() -> None:
     summary_df = summary_df[metric_order]
     summary_df.to_csv(output_dir / "tables" / "ppo_variant_comparison.csv", index=False)
     write_latex_table(summary_df, output_dir / "tables" / "ppo_variant_comparison.tex")
+    combined = summary_df[
+        ["variant", "accuracy_classified", "macro_f1_classified", "mean_best_iou"]
+    ].rename(
+        columns={
+            "variant": "method",
+            "accuracy_classified": "accuracy",
+            "macro_f1_classified": "macro_f1",
+        }
+    )
+    baseline_for_combined = baseline_df.rename(columns={"baseline": "method"})
+    baseline_for_combined["mean_best_iou"] = np.nan
+    pd.concat(
+        [baseline_for_combined[["method", "accuracy", "macro_f1", "mean_best_iou"]], combined],
+        ignore_index=True,
+    ).to_csv(output_dir / "tables" / "ppo_vs_baselines.csv", index=False)
 
     curves = []
     for variant_name in args.variants:
@@ -875,6 +1219,23 @@ def main() -> None:
     best = summary_df.sort_values(
         ["macro_f1_classified", "mean_best_iou", "mean_reward"], ascending=False
     ).iloc[0]
+    best_variant_name = str(best["variant"])
+    best_eval_path = output_dir / "models" / best_variant_name / "test_episode_metrics.csv"
+    if best_eval_path.exists():
+        best_eval = pd.read_csv(best_eval_path)
+        write_per_class_metrics(best_eval, best_variant_name, output_dir)
+        best_model = PPO.load(output_dir / "models" / best_variant_name / "model_final.zip")
+        generate_qualitative_attention_examples(
+            metadata=metadata,
+            model=best_model,
+            variant=VARIANTS[best_variant_name],
+            output_dir=output_dir,
+            image_size=args.image_size,
+            image_cache=image_cache,
+            cache_side=args.cache_side,
+            auxiliary_classifier=auxiliary_classifier,
+            seed=args.seed + 123,
+        )
     report = {
         "dataset_dir": str(dataset_dir),
         "output_dir": str(output_dir),
