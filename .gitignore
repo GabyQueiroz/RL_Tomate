@@ -1,0 +1,24 @@
+# Dataset and generated experiment outputs
+Tomato Disease Dataset/
+runs/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Logs and model artifacts
+*.log
+*.zip
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
